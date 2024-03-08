@@ -1,0 +1,531 @@
+---
+title: "EEN manuscript untargeted PCA"
+author: "Quirin Manz"
+date: "`r Sys.Date()`"
+output: html_document
+---
+## Load packages
+
+```{r package_loading}
+library(data.table)
+library(ggfortify)
+library(readxl)
+library(mixOmics)
+```
+
+## Load and wrangle data
+
+```{r data_loading}
+metadata <- as.data.table(read_excel('Metadata_Metabolome_sample_selection_Mouse.xlsx', sheet = 1))
+setnames(metadata, '...1', 'SampleID')
+metadata[, SampleID := sprintf('X%03.f', SampleID)]
+metadata[, Patient:=gsub(pattern = ' EEN (incomplete )?remission', replacement = '', Patient)]
+metadata[, Patient:=gsub(pattern = ' PreEEN active', replacement = '', Patient, fixed = TRUE)]
+metadata[, Experiment_old := Experiment]
+metadata[, Experiment := gsub(pattern = '_', replacement = ' - ', MP_FMT, fixed = TRUE)]
+setnames(metadata, 'inflammation', 'Inflammation')
+setkey(metadata, SampleID)
+
+data_dir <- 'HP01-Mouse jEMqEc@4c'
+expression_files <- list.files(data_dir, 'ExpressenSet', full.names = TRUE)
+raw_dt <- rbindlist(sapply(expression_files, function(f) read_excel(f, sheet = 'Expression'), simplify = FALSE), idcol='file')
+
+pattern <- "(HILIC|RP)_(pos|neg)"
+raw_dt[, feature:=paste0(gsub(paste0("^.*(", pattern, ").*$"), "\\1", file), '_', ID)]
+
+melted_dt <- melt(raw_dt, id.vars = c('feature', 'file', 'ID'), variable.name = 'SampleID')
+feature_dt <- dcast(melted_dt, SampleID ~ feature, value.var = 'value')
+feature_columns <- names(feature_dt[, -'SampleID'])
+
+dt <- feature_dt[metadata]
+```
+
+## PCA function
+```{r}
+na_actions <- 'half_min' #c('drop', 'mean', 'half_min', 'zero')
+col_per_group <- c('inflamed' = '#eca1a2', 'not inflamed' = '#A0D29F')
+shape.mapping <- c('FMT1' = 16, 'FMT3' = 17, 'FMT4' = 15)
+shapes_per_group <- shape.mapping[metadata[, sapply(strsplit(unique(Experiment), " - ", fixed = TRUE), tail, 1)]]
+names(shapes_per_group) <- metadata[, unique(Experiment)]
+
+my_pca <-
+  function(dt,
+           filter_value,
+           filter_column,
+           shape_by = 'Experiment',
+           color_by = 'Inflammation',
+           na.threshold = 0.5,
+           na.action = 'half_min',
+           my_dist = 'centroids.dist',
+           conduct_splsda = TRUE,
+           conduct_plsda = FALSE,
+           max_compn = 4,
+           verbose = TRUE,
+           col.per.group = col_per_group,
+           shapes.per.group = shapes_per_group) {
+    this_name <- paste0(
+      gsub(' ', '', filter_value, fixed = TRUE), collapse = '::'
+    )
+    if(verbose) print(paste0('running PCA for ', this_name))
+    pca_dt <- copy(dt[get(filter_column) %in% filter_value])
+    if (verbose)
+    print(paste0('starting with ', length(feature_columns), ' features'))
+    # Remove all NA columns:
+    all_na <- pca_dt[, colSums(is.na(pca_dt)) == .N]
+    if (verbose) print(paste('dropping ', sum(all_na), ' features because they are all NA'))
+    pca_dt <- pca_dt[,!all_na, with = FALSE]
+    
+    melted_pca_dt <- melt(pca_dt, measure.vars = feature_columns[feature_columns %in% names(pca_dt)])
+    nas_per_feature <- melted_pca_dt[, .(NAs = sum(is.na(value)), N=.N), by=.(Inflammation, variable)]
+    if (verbose) print(ggplot(nas_per_feature, aes(x = NAs/N, color= Inflammation)) + stat_ecdf() + scale_color_manual(values = col.per.group) + theme_bw() + labs(title='NA distribution'))
+    
+    more_than_50_na <- nas_per_feature[NAs/N > na.threshold, unique(variable)]
+    if (verbose) print(paste('dropping ', length(more_than_50_na), ' features because they have > 50% NAs in one of the groups'))
+    pca_mat <-
+      as.matrix(pca_dt[, names(pca_dt) %in% feature_columns & !names(pca_dt) %in% more_than_50_na, with = FALSE])
+    
+    if (na.action == 'drop') {
+      # Identify columns without any missing values
+      non_na_columns <- !colSums(is.na(pca_mat))
+      if (verbose) print(paste(
+        'dropping ',
+        sum(!non_na_columns),
+        ' features because they contain NA values'
+      ))
+      # Subset the matrix to keep only columns without missing values
+      pca_mat <- pca_mat[, non_na_columns]
+    } else if (na.action == 'mean') {
+      # Replace NA with column mean
+      for (i in 1:ncol(pca_mat)) {
+        pca_mat[is.na(pca_mat[, i]), i] <- mean(pca_mat[, i], na.rm = TRUE)
+      }
+    } else if (na.action == 'half_min') {
+      # Replace NA with column mean
+      for (i in 1:ncol(pca_mat)) {
+        pca_mat[is.na(pca_mat[, i]), i] <-
+          min(pca_mat[, i], na.rm = TRUE) / 2
+      }
+    } else if (na.action == 'zero') {
+      # Replace NA with zero
+      pca_mat[is.na(pca_mat)] <- 0
+    } else {
+      stop('illegal value for na.action')
+    }
+    # Remove columns with zero variance
+    constant_cols <- apply(pca_mat, 2, var) == 0
+    if (verbose) print(paste(
+      'dropping ',
+      sum(constant_cols),
+      ' features because they are constant'
+    ))
+    pca_mat <- pca_mat[, !constant_cols]
+    pca <- prcomp(pca_mat, scale = TRUE)
+    dimred_plot <- autoplot(
+      pca,
+      data = pca_dt,
+      colour = color_by,
+      shape = shape_by,
+      size = 5,
+      frame = TRUE,
+      frame.type = 'norm'
+    ) +
+      theme_bw() +
+      scale_color_manual(values = col.per.group) +
+      scale_shape_manual(values = shapes.per.group) +
+      labs(title = paste0(filter_column, ': ', paste(filter_value, collapse = ', ')))#, '; NAs: ', na.action))
+    print(dimred_plot)
+    ggsave(paste0('pca_', this_name, '.pdf'))
+    
+    # Calculate variance explained
+    var_explained <- pca$sdev ^ 2
+    total_variance <- sum(var_explained)
+    prop_var_explained <- var_explained / total_variance
+    cum_var_explained <- cumsum(prop_var_explained)
+    
+    # Create a data frame for ggplot
+    pca_data <- data.table(
+      PC = seq_along(prop_var_explained),
+      Variance = prop_var_explained,
+      Cumulative = cum_var_explained
+    )
+    
+    scree_plot <- ggplot(pca_data, aes(x = PC)) +
+      geom_col(aes(y = Variance), fill = "blue") +
+      geom_line(aes(y = Cumulative),
+                color = "darkgrey",
+                linetype = "dashed") +
+      geom_point(aes(y = Cumulative), color = "darkgrey") +
+      scale_y_continuous(breaks = seq(0, 1, by = .1)) +
+      scale_x_continuous(breaks = 1:length(prop_var_explained)) +
+      labs(title = "Scree Plot",
+           x = "Principal Component",
+           y = "Proportion of Variance Explained") + theme_bw() +
+      geom_text(
+        aes(y = Variance, label = sprintf("%.2f%%", Variance * 100)),
+        position = position_nudge(y = 0.07),
+        size = 3,
+        color = "blue",
+        angle = 90
+      ) +
+      geom_text(
+        aes(y = Cumulative, label = sprintf("%.2f%%", Cumulative * 100)),
+        position = position_nudge(y = -0.05),
+        size = 3,
+        color = "darkgrey",
+        angle = 45
+      )
+    
+    max_PC <- which(cum_var_explained > 0.9)[1]
+    if (verbose) print(paste('90% of variance explained by', max_PC, 'PCs'))
+    
+    my_manova <-
+      manova(pca[['x']][, paste0('PC', seq(max_PC))] ~ pca_dt[, Inflammation])
+    
+    if (conduct_splsda == TRUE) {
+      # Tune the number of components and the number of features to keep
+      if (verbose) print("Conduct splsda...")
+      list.keepX <- c(1:10,  seq(20, 100, 10))
+      if (verbose) print("tune...")
+      nfolds <- pca_dt[, min(table(Inflammation))]
+      browser()
+      tune_splsda <- tune.splsda(pca_mat, pca_dt[, Inflammation], ncomp = max_compn, validation = 'Mfold', 
+                                 folds = nfolds, dist = my_dist, progressBar = verbose,
+                                 test.keepX = list.keepX, nrepeat = 50, auc = TRUE, cpus = 1)
+      
+      ncomp <- tune_splsda$choice.ncomp$ncomp
+      select.keepX <- tune_splsda$choice.keepX[1:ncomp]  
+      
+      if (verbose) print(paste0('Optimal number of components: ', ncomp))
+      if (verbose) print(paste0('Optimal number of features to keep: ', select.keepX))
+      
+      spls_da <- splsda(pca_mat, pca_dt[, Inflammation], ncomp = ncomp, keepX = select.keepX) 
+      perf_spls_da <- perf(spls_da, folds = nfolds, validation = "Mfold", 
+                  dist = my_dist, progressBar = verbose, nrepeat = 50)
+      
+      stability_plot <- ggplot(rbindlist(lapply(perf_spls_da$features$stable, function(x) list(feature = names(x), stability = x)), idcol = 'comp'), 
+                               aes(x = reorder(feature, -stability), y = as.numeric(stability), fill = comp)) +
+        geom_col(position = 'dodge') +
+        labs(title = 'Stability of features', x = 'Feature', y = 'Stability') +
+        theme_bw() + 
+        theme(axis.text.x = element_text(angle = 90, vjust = .5))
+      print(stability_plot)
+      ggsave(paste0('stability_', this_name, '.pdf'))
+      
+      vip_dt <- as.data.table(vip(spls_da), keep.rownames = 'feature')
+      melt_vip <- melt(vip_dt, id.vars = 'feature')[value > 0][order(-value)]
+      if (verbose) print(melt_vip[1:10])
+      fwrite(melt_vip, paste0('vip_', this_name, '.csv'))
+      vip_boxplot <- ggplot(melted_pca_dt[variable %in% melt_vip[1:10, feature]],
+                            aes(y = value, x = factor(variable, levels=melt_vip[1:10, unique(feature)]), color=Inflammation)) + 
+          geom_boxplot(width = 0.8, fill = NA, outlier.color = NA) + 
+          geom_point(position = position_jitterdodge(jitter.width = 0.2, jitter.height = 0), 
+                     aes(color = Inflammation, shape = Experiment)) + 
+          theme_bw() + 
+          scale_color_manual(values = col.per.group) + 
+          scale_shape_manual(values = shapes.per.group) + 
+          labs(title = 'Top 10 VIP features', x = 'Feature', y = 'Raw Value') + 
+          theme(axis.text.x = element_text(angle = 90, vjust = .5))
+      print(vip_boxplot)
+      ggsave(paste0('vip_', this_name, '.pdf'))
+      
+      print_comp <- c(1, 1)
+      if (ncomp > 1) print_comp <- c(1, 2)
+      indiv_plot <- plotIndiv(spls_da, 
+                              comp = print_comp,
+                              ind.names = FALSE,
+                              ellipse = ncomp > 1, 
+                              legend = TRUE,
+                              col.per.group = col.per.group)
+      
+      my_ggp <- ggplot(
+        cbind(indiv_plot$graph$data, pca_dt[, c('Inflammation', 'Experiment')]),
+        aes(
+          x = x,
+          y = y,
+          color = Inflammation,
+          shape = Experiment
+        )
+      ) + geom_point(size = 3) +
+        labs(
+          title = paste0(
+            'PLS-DA comp 1-2: ',
+            filter_column,
+            ': ',
+            paste(filter_value, collapse = ', ')
+          ),
+          x = 'PLS-DA comp 1',
+          y = 'PLS-DA comp 1'
+        ) +
+        theme_bw() 
+      
+      if (ncomp > 1) {
+        background <- background.predict(spls_da, comp.predicted = 2, dist = my_dist, 
+                                         ylim = indiv_plot$graph[["coordinates"]][["limits"]][["y"]], 
+                                         xlim = indiv_plot$graph[["coordinates"]][["limits"]][["x"]])
+        background <-
+          rbindlist(lapply(background, as.data.frame), idcol = 'Inflammation')
+        
+        my_ggp <- my_ggp + labs(y = 'PLS-DA comp 2') +
+        geom_polygon(
+          data = background,
+          aes(x = Var1, y = Var2, fill = Inflammation),
+          inherit.aes = FALSE,
+          show.legend = FALSE
+        ) + scale_fill_manual(values = alpha(col.per.group, .1)) + geom_point(size = 3) + scale_shape_manual(values = shapes.per.group) +
+        geom_path(
+          data = rbind(
+            setDT(indiv_plot$df.ellipse)[, .(x = Col1, y = Col2, Inflammation = 'inflamed')],
+            setDT(indiv_plot$df.ellipse)[, .(x = Col3, y = Col4, Inflammation = 'not inflamed')]
+          ),
+          aes(x = x, y = y, color = Inflammation),
+          linewidth = 1,
+          inherit.aes = FALSE
+        ) 
+      }
+      
+      my_ggp <- my_ggp + scale_color_manual(values = col.per.group)
+      
+      print(my_ggp)
+      
+      ggsave(paste0('pls_da_', this_name, '.pdf'))
+      
+      
+      for (i in 1:ncomp){
+        pdf(paste0('loadings_', this_name, '_comp', i, '.pdf'))
+        plotLoadings(spls_da, comp = i, method = 'median', contrib = 'max', legend.color = col.per.group)
+        dev.off()
+      }
+      
+      } else if (conduct_plsda == TRUE) {
+        pls_da <-
+          plsda(pca_mat, pca_dt[, Inflammation], ncomp = max_compn)
+        perf_pls_da <- perf(
+          pls_da,
+          validation = 'loo',
+          progressBar = FALSE,
+          auc = TRUE
+        )
+        # plot(perf_pls_da, sd = TRUE, legend.position = 'horizontal')
+        
+        ber_matrix <- perf_pls_da$error.rate$BER
+        min_index <-
+          which(ber_matrix == min(ber_matrix), arr.ind = TRUE)[1, , drop = FALSE]
+        min_row <- rownames(ber_matrix)[min_index[, "row"]]
+        min_distance <- colnames(ber_matrix)[min_index[, "col"]]
+        min_ncomp <-
+          max(as.integer(sub('comp', '', min_row, fixed = TRUE)), 2L)
+        if (verbose) print(paste('min ncomp:', min_ncomp, '; min distance:', min_distance))
+        
+        # pls_da_final <- plsda(pca_mat, pca_dt[, Inflammation], ncomp = min_ncomp)
+        background_pls_da_final <- background.predict(pls_da, #_final,
+                                                      comp.predicted = min_ncomp,
+                                                      dist = min_distance)
+      
+      indiv_plot <- plotIndiv(
+        pls_da,
+        #_final,
+        ind.names = FALSE,
+        legend = TRUE,
+        col.per.group = col.per.group,
+        comp = c(1, 2),
+        ellipse = TRUE,
+        title = ,
+        # '; NAs: ', na.action),
+        size.title = rel(1),
+        X.label = 'PLS-DA comp 1',
+        Y.label = ,
+        background = background_pls_da_final
+      )
+      
+      background <-
+        rbindlist(lapply(background_pls_da_final, as.data.frame), idcol = 'group')
+      
+      my_ggp <- ggplot(
+        cbind(indiv_plot$graph$data, pca_dt[, 'Experiment']),
+        aes(
+          x = x,
+          y = y,
+          color = group,
+          shape = Experiment
+        )
+      ) + geom_point() +
+        labs(
+          title = paste0(
+            'PLS-DA comp 1-2: ',
+            filter_column,
+            ': ',
+            paste(filter_value, collapse = ', ')
+          ),
+          x = 'PLS-DA comp 1',
+          y = 'PLS-DA comp 2'
+        ) +
+        theme_bw() +
+        geom_polygon(
+          data = background,
+          aes(x = Var1, y = Var2, fill = group),
+          inherit.aes = FALSE,
+          show.legend = FALSE
+        ) + scale_fill_manual(values = alpha(col.per.group, .1)) + geom_point(size = 3) + scale_shape_manual(values = shapes.per.group) +
+        geom_path(
+          data = rbind(
+            setDT(indiv_plot$df.ellipse)[, .(x = Col1, y = Col2, group = 'inflamed')],
+            setDT(indiv_plot$df.ellipse)[, .(x = Col3, y = Col4, group = 'not inflamed')]
+          ),
+          aes(x = x, y = y, color = group),
+          linewidth = 1,
+          inherit.aes = FALSE
+        ) + scale_color_manual(values = col.per.group)
+      print(my_ggp)
+      ggsave(paste0('pls_da_', this_name, '.pdf'))
+    }
+    
+    
+    list(dimred = dimred_plot,
+         scree = scree_plot,
+         manova = my_manova) #, pls_da_perf = pls_da_perf_plot, pls_da = pls_da_plot)
+  }
+
+```
+
+```{r, eval=FALSE, include=FALSE}
+shape_by = 'Experiment'
+color_by = 'Inflammation'
+na.threshold = 0.5
+na.action = 'half_min'
+conduct_splsda = TRUE
+conduct_plsda = FALSE
+max_compn = 4
+my_dist = 'centroids.dist'
+verbose = TRUE
+filter_value = 'Patient 1'
+filter_column = 'Patient'
+col.per.group = col_per_group
+shapes.per.group = shapes_per_group
+```
+
+## 1. PCA
+
+E6, E13, E12 (patient 1) 
+
+MP1_FMT1, MP1_FMT3, MP1_FMT4,
+
+different symbol per experiment
+
+Inflamed (red-ish) non inflamed (green-ish)
+
+```{r first_pca}
+for (na_action in na_actions) {
+  print(na_action)
+  res <- my_pca(dt, filter_value = 'Patient 1', filter_column = 'Patient', na.action = na_action)
+  # print(res$dimred)
+  # ggsave('pca1.pdf')
+  # # print(res$scree)
+  # # ggsave('scree1.pdf')
+  # # print(summary(res$manova))
+  # print(res$pls_da_perf)
+  # print(res$pls_da_plot)
+}
+```
+
+## 2. PCA
+
+E2, E15, E20 (patient 2)
+
+MP2_FMT1, MP2_FMT3, MP2_FMT4,
+
+different symbol per experiment
+
+Inflamed (red-ish) non inflamed (green-ish)
+
+```{r second_pca}
+for (na_action in na_actions) {
+  print(na_action)
+  res <- my_pca(dt, filter_value = 'Patient 2', filter_column = 'Patient', na.action = na_action)
+  # print(res$dimred)
+  # ggsave('pca2.pdf')
+  # # print(res$scree)
+  # # ggsave('scree2.pdf')
+  # # print(summary(res$manova))
+  # print(res$pls_da_perf)
+  # print(res$pls_da_plot)
+}
+```
+
+## 3. PCA
+
+E18, E23, E27 (patient 3)
+
+MP3_FMT1, MP3_FMT3, MP3_FMT4,
+
+different symbol per experiment
+
+Inflamed (red-ish) non inflamed (green-ish)
+
+```{r third_pca}
+for (na_action in na_actions) {
+  print(na_action)
+  res <- my_pca(dt, filter_value = 'Patient 3', filter_column = 'Patient', na.action = na_action)
+  # print(res$dimred)
+  # ggsave('pca3.pdf')
+  # print(res$scree)
+  # ggsave('scree3.pdf')
+  # print(summary(res$manova))
+}
+```
+
+## 4. PCA
+
+E4, E16, E25 (patient 2, relapse, supplement)
+
+Supplement MP2_relapse_FMT1, MP2_relapse_FMT3, MP2_relapse_FMT4,
+
+different symbol per experiment
+
+Inflamed (red-ish) non inflamed (green-ish) (will be mostly inflamed!!)
+
+```{r fourth_pca}
+for (na_action in na_actions) {
+  print(na_action)
+  res <- my_pca(dt, filter_value = 'Patient 2  relapse', filter_column = 'Patient', na.action = na_action)
+  # print(res$dimred)
+  # ggsave('pca4.pdf')
+  # print(res$scree)
+  # ggsave('scree4.pdf')
+  # print(summary(res$manova))
+}
+```
+
+## 5. PCA
+
+alle außer E4, E16, E25
+
+Summary of MP1, MP2, MP3, exclusive relapse
+
+Not sure if different symbols per experiment as above is overkill with then 6 different experiments, or if we go with only patient symbols (3)
+
+inflamed  (red-ish) non inflamed (green-ish)
+
+
+```{r fifth_pca}
+new_shapes <- c(
+  'MP1 - FMT1' = 2,   # Triangle (empty)
+  'MP1 - FMT3' = 11,   # Triangle (crossed)
+  'MP1 - FMT4' = 17,  # Triangle (filled)
+  'MP2 - FMT1' = 0,   # Square (empty)
+  'MP2 - FMT3' = 7,   # Square (crossed)
+  'MP2 - FMT4' = 15,  # Square (filled)
+  'MP3 - FMT1' = 1,   # Circle (empty)
+  'MP3 - FMT3' = 13,  # Circle (crossed)
+  'MP3 - FMT4' = 16   # Circle (filled)
+)
+  
+for (na_action in na_actions) {
+  print(na_action)
+  res <- my_pca(dt, filter_value = c('Patient 1', 'Patient 2', 'Patient 3'), filter_column = 'Patient', shapes.per.group = new_shapes, na.action = na_action)
+  # print(res$dimred)
+  # ggsave('pca5.pdf')
+  # print(res$scree)
+  # ggsave('scree5.pdf')
+  # print(summary(res$manova))
+}
+```
